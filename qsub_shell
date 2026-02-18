@@ -10,6 +10,7 @@
 #   -c, --cores N       Number of CPU cores (default: 1)
 #   -p, --project NAME  Project group name (default: gcf51142)
 #   -q, --queue NAME    Queue name (default: rt_HG for GPU, rt_HC for CPU-only)
+#   -r, --resv ID       Reservation ID (e.g., R1538111)
 #   -n, --name NAME     Job name (default: interactive)
 #   -h, --help          Show this help
 
@@ -22,6 +23,7 @@ MEMORY_GB=8
 CPU_CORES=1
 PROJECT_GROUP="gcf51142"
 QUEUE_NAME="rt_HG"
+RESERVATION_ID=""
 JOB_NAME="interactive"
 CPU_ONLY=false
 
@@ -40,6 +42,7 @@ Options:
     -c, --cores N       Number of CPU cores (default: 1)
     -p, --project NAME  Project group name (default: gcf51142)
     -q, --queue NAME    Queue name (default: rt_HG for GPU, rt_HC for CPU-only)
+    -r, --resv ID       Reservation ID (e.g., R1538111)
     -n, --name NAME     Job name (default: interactive)
     -h, --help          Show this help
 
@@ -50,6 +53,7 @@ Examples:
     qsub_shell --no-gpu                 # CPU-only mode
     qsub_shell -g 0                     # CPU-only mode (alternative)
     qsub_shell -m 16 -c 4               # 16GB RAM, 4 CPU cores
+    qsub_shell --resv R1538111           # Use reserved node
 
 Resource Types:
     rt_HC: CPU-only, CPU32, Memory320GB
@@ -98,6 +102,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -q|--queue)
             QUEUE_NAME="$2"
+            shift 2
+            ;;
+        -r|--resv)
+            RESERVATION_ID="$2"
             shift 2
             ;;
         -n|--name)
@@ -149,7 +157,12 @@ MINUTES=$((TIME_LIMIT % 60))
 TIME_FORMATTED=$(printf "%02d:%02d:00" $HOURS $MINUTES)
 
 # Build qsub command
-QSUB_CMD="qsub -I -P $PROJECT_GROUP -q $QUEUE_NAME -l select=1 -l walltime=$TIME_FORMATTED -N $JOB_NAME"
+if [ -n "$RESERVATION_ID" ]; then
+    # Reservation mode: queue = reservation ID, resource type passed via -v RTYPE
+    QSUB_CMD="qsub -I -P $PROJECT_GROUP -q $RESERVATION_ID -v RTYPE=$QUEUE_NAME -l select=1 -l walltime=$TIME_FORMATTED -N $JOB_NAME"
+else
+    QSUB_CMD="qsub -I -P $PROJECT_GROUP -q $QUEUE_NAME -l select=1 -l walltime=$TIME_FORMATTED -N $JOB_NAME"
+fi
 
 # Add GPU specification if using multi-GPU queues
 if [ "$QUEUE_NAME" = "rt_AG" ] || [ "$QUEUE_NAME" = "rt_G" ]; then
@@ -158,7 +171,12 @@ fi
 
 echo "Starting interactive job with:"
 echo "  Project: $PROJECT_GROUP"
-echo "  Queue: $QUEUE_NAME"
+if [ -n "$RESERVATION_ID" ]; then
+    echo "  Reservation: $RESERVATION_ID"
+    echo "  Resource type: $QUEUE_NAME"
+else
+    echo "  Queue: $QUEUE_NAME"
+fi
 if [ "$GPU_COUNT" -eq 0 ]; then
     echo "  GPUs: CPU-only mode"
 else
