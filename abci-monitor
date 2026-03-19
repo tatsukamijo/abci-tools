@@ -271,12 +271,18 @@ def parse_pbsnodes(node_names: List[str]) -> Dict[str, Dict[str, int]]:
 def slots_to_gpus(slots: int) -> int:
     """Estimate GPU count from CPU slot count on a node.
 
-    rt_HF: 192 slots (full node) = 8 GPUs
-    rt_HG: 16 slots = 1 GPU
+    ABCI v3 resource types have fixed CPU counts:
+      rt_HF: 192 CPUs = 8 GPUs (full node)
+      rt_HC:  32 CPUs = 0 GPUs (CPU-only)
+      rt_HG:  16 CPUs = 1 GPU
     """
-    if slots >= 48:  # Likely rt_HF (full node)
-        return 8
-    return max(1, slots // 16)
+    if slots >= 192:
+        return 8   # rt_HF
+    elif slots >= 32:
+        return 0   # rt_HC (CPU-only)
+    elif slots >= 16:
+        return 1   # rt_HG
+    return 0
 
 
 # ── Aggregation ─────────────────────────────────────────────────────────────
