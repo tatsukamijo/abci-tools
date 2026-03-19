@@ -1,0 +1,536 @@
+#!/usr/bin/env python3
+"""ABCI Reservation Monitor - htop-like visualization of reserved node usage."""
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+
+# ── Colors ──────────────────────────────────────────────────────────────────
+
+NO_COLOR = os.environ.get("NO_COLOR") is not None
+
+def _c(code: str) -> str:
+    return "" if NO_COLOR else code
+
+class C:
+    RESET   = _c("\033[0m")
+    BOLD    = _c("\033[1m")
+    DIM     = _c("\033[2m")
+    RED     = _c("\033[31m")
+    GREEN   = _c("\033[32m")
+    YELLOW  = _c("\033[33m")
+    BLUE    = _c("\033[34m")
+    MAGENTA = _c("\033[35m")
+    CYAN    = _c("\033[36m")
+    WHITE   = _c("\033[97m")
+    BG_GREEN  = _c("\033[42m")
+    BG_YELLOW = _c("\033[43m")
+    BG_RED    = _c("\033[41m")
+
+# ── Data classes ────────────────────────────────────────────────────────────
+
+@dataclass
+class JobInfo:
+    job_id: str
+    name: str
+    user: str
+    time_use: str
+    state: str
+    queue: str
+    # filled from qstat -f (own jobs only)
+    node_gpus: Dict[str, int] = field(default_factory=dict)  # node -> ngpus
+    rtype: str = ""
+    is_detailed: bool = False
+
+@dataclass
+class NodeUsage:
+    name: str
+    gpus_total: int = 8
+    gpus_used_own: int = 0
+    gpus_used_other: int = 0
+    jobs: List[JobInfo] = field(default_factory=list)
+
+@dataclass
+class Reservation:
+    resv_id: str
+    state: str
+    owner: str
+    start: str
+    end: str
+    nodes: List[str] = field(default_factory=list)
+    node_count: int = 0
+    queue_run: int = 0
+    queue_queued: int = 0
+    queue_held: int = 0
+
+# ── Subprocess helper ───────────────────────────────────────────────────────
+
+def run_cmd(cmd: List[str], timeout: int = 30) -> str:
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.stdout
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return ""
+
+# ── Parsers ─────────────────────────────────────────────────────────────────
+
+def parse_qrstat() -> List[str]:
+    """Return list of reservation IDs from qrstat."""
+    out = run_cmd(["qrstat"])
+    ids = []
+    for line in out.strip().splitlines():
+        m = re.match(r"(R\d+)\.pbs\d+", line.strip())
+        if m:
+            ids.append(m.group(1))
+    return ids
+
+
+def parse_qrstat_full(resv_id: str) -> Optional[Reservation]:
+    """Parse qrstat -f output for a reservation."""
+    out = run_cmd(["qrstat", "-f", resv_id])
+    if not out.strip():
+        return None
+
+    # Join continuation lines (indented with whitespace)
+    lines = out.splitlines()
+    joined: List[str] = []
+    for line in lines:
+        if line and line[0] in (" ", "\t") and joined:
+            joined[-1] += line.strip()
+        else:
+            joined.append(line)
+
+    kv: Dict[str, str] = {}
+    for line in joined:
+        if "=" in line:
+            key, _, val = line.partition("=")
+            kv[key.strip()] = val.strip()
+
+    state_str = kv.get("reserve_state", "")
+    if "RUNNING" in state_str:
+        state = "RN"
+    elif "CONFIRMED" in state_str:
+        state = "CO"
+    elif "DEGRADED" in state_str:
+        state = "DG"
+    else:
+        state = state_str[:4]
+
+    # Parse resv_nodes to get node names
+    resv_nodes_str = kv.get("resv_nodes", "")
+    node_names = list(dict.fromkeys(re.findall(r"(hnode\d+)\[", resv_nodes_str)))
+
+    # Parse dates
+    start_raw = kv.get("reserve_start", "")
+    end_raw = kv.get("reserve_end", "")
+    start = _parse_date(start_raw)
+    end = _parse_date(end_raw)
+
+    nodect = int(kv.get("Resource_List.nodect", len(node_names)))
+
+    return Reservation(
+        resv_id=resv_id,
+        state=state,
+        owner=kv.get("Reserve_Owner", "").split("@")[0],
+        start=start,
+        end=end,
+        nodes=node_names,
+        node_count=nodect,
+    )
+
+
+def _parse_date(s: str) -> str:
+    """Extract readable date like 'Mar 16 10:00' from PBS date string."""
+    # Format: "Mon Mar 16 10:00:00 2026"
+    m = re.match(r"\w+\s+(\w+\s+\d+)\s+(\d+:\d+)", s)
+    if m:
+        return f"{m.group(1)} {m.group(2)}"
+    return s[:20] if s else "?"
+
+
+def parse_qstat_queue(queue: str) -> Tuple[int, int, int]:
+    """Return (running, queued, held) counts for a queue."""
+    out = run_cmd(["qstat", "-Q", queue])
+    for line in out.strip().splitlines():
+        parts = line.split()
+        if parts and parts[0] == queue:
+            # Queue Max Tot Ena Str Que Run Hld Wat Trn Ext Type
+            try:
+                run = int(parts[6])
+                que = int(parts[5])
+                hld = int(parts[7])
+                return run, que, hld
+            except (IndexError, ValueError):
+                pass
+    return 0, 0, 0
+
+
+def parse_qgstat() -> List[JobInfo]:
+    """Parse qgstat output to get all group jobs."""
+    out = run_cmd(["qgstat"])
+    jobs = []
+    for line in out.strip().splitlines():
+        parts = line.split()
+        if not parts or not parts[0].endswith(".pbs1"):
+            continue
+        try:
+            job = JobInfo(
+                job_id=parts[0],
+                name=parts[1] if len(parts) > 1 else "?",
+                user=parts[2] if len(parts) > 2 else "?",
+                time_use=parts[3] if len(parts) > 3 else "0",
+                state=parts[4] if len(parts) > 4 else "?",
+                queue=parts[5] if len(parts) > 5 else "?",
+            )
+            jobs.append(job)
+        except IndexError:
+            pass
+    return jobs
+
+
+def parse_qstat_full(job_id: str) -> Dict[str, str]:
+    """Parse qstat -f for a job. Returns key-value dict, empty if no permission."""
+    out = run_cmd(["qstat", "-f", job_id])
+    if not out.strip():
+        return {}
+
+    # qstat -f format: "    key = value" with continuation lines indented by \t
+    lines = out.splitlines()
+    joined: List[str] = []
+    for line in lines:
+        # Continuation lines start with \t (tab) after the 4-space indent
+        if line.startswith("\t") and joined:
+            joined[-1] += line.strip()
+        else:
+            joined.append(line)
+
+    kv: Dict[str, str] = {}
+    for line in joined:
+        line = line.strip()
+        if " = " in line:
+            key, _, val = line.partition(" = ")
+            kv[key.strip()] = val.strip()
+    return kv
+
+
+def parse_exec_vnode(exec_vnode: str) -> Dict[str, int]:
+    """Parse exec_vnode string to get node -> GPU count mapping."""
+    node_gpus: Dict[str, int] = {}
+    for m in re.finditer(r"(hnode\d+)\[\d+\]([^)]*)", exec_vnode):
+        node = m.group(1)
+        attrs = m.group(2)
+        ngpus_m = re.search(r"ngpus=(\d+)", attrs)
+        ngpus = int(ngpus_m.group(1)) if ngpus_m else 0
+        node_gpus[node] = node_gpus.get(node, 0) + ngpus
+    return node_gpus
+
+
+def parse_pbsnodes(node_names: List[str]) -> Dict[str, Dict[str, int]]:
+    """Run pbsnodes for given nodes, return {node: {job_id: slot_count}}.
+
+    Slot count can be used to estimate GPU usage:
+      192 slots (full node) = rt_HF = 8 GPUs
+      16 slots = rt_HG = 1 GPU
+    """
+    if not node_names:
+        return {}
+
+    out = run_cmd(["pbsnodes"] + node_names, timeout=60)
+    if not out.strip():
+        return {}
+
+    result: Dict[str, Dict[str, int]] = {}
+    current_node = ""
+
+    for line in out.splitlines():
+        line_stripped = line.strip()
+        # Node name line (no leading whitespace)
+        if line and not line[0].isspace() and line_stripped.startswith("hnode"):
+            current_node = line_stripped
+            result[current_node] = {}
+        elif "jobs =" in line_stripped and current_node:
+            # Parse: jobs = 1700699.pbs1/0, 1700699.pbs1/1, ...
+            jobs_str = line_stripped.split("=", 1)[1].strip()
+            slot_counts: Dict[str, int] = {}
+            for entry in jobs_str.split(","):
+                entry = entry.strip()
+                if "/" in entry:
+                    job_id = entry.rsplit("/", 1)[0]
+                    slot_counts[job_id] = slot_counts.get(job_id, 0) + 1
+            result[current_node] = slot_counts
+
+    return result
+
+
+def slots_to_gpus(slots: int) -> int:
+    """Estimate GPU count from CPU slot count on a node.
+
+    rt_HF: 192 slots (full node) = 8 GPUs
+    rt_HG: 16 slots = 1 GPU
+    """
+    if slots >= 48:  # Likely rt_HF (full node)
+        return 8
+    return max(1, slots // 16)
+
+
+# ── Aggregation ─────────────────────────────────────────────────────────────
+
+def build_dashboard(resv_filter: Optional[List[str]] = None) -> List[Tuple[Reservation, Dict[str, NodeUsage]]]:
+    """Build full dashboard data."""
+    # Get reservations
+    resv_ids = parse_qrstat()
+    if resv_filter:
+        resv_ids = [r for r in resv_ids if r in resv_filter]
+
+    if not resv_ids:
+        return []
+
+    # Get all group jobs (for job metadata: user, name, time)
+    all_jobs = parse_qgstat()
+    job_lookup: Dict[str, JobInfo] = {j.job_id: j for j in all_jobs}
+    my_user = os.environ.get("USER", "")
+
+    results = []
+
+    for resv_id in resv_ids:
+        resv = parse_qrstat_full(resv_id)
+        if not resv:
+            continue
+
+        # Queue stats
+        run, que, hld = parse_qstat_queue(resv_id)
+        resv.queue_run = run
+        resv.queue_queued = que
+        resv.queue_held = hld
+
+        # Init node usage map
+        node_map: Dict[str, NodeUsage] = {}
+        for n in resv.nodes:
+            node_map[n] = NodeUsage(name=n)
+
+        if resv.state != "CO" and resv.nodes:
+            # Use pbsnodes to get accurate per-node job mapping
+            pbs_data = parse_pbsnodes(resv.nodes)
+
+            for node_name in resv.nodes:
+                nu = node_map[node_name]
+                node_jobs = pbs_data.get(node_name, {})
+
+                for job_id, slots in node_jobs.items():
+                    gpus = slots_to_gpus(slots)
+                    job_info = job_lookup.get(job_id)
+
+                    if job_info is None:
+                        # Job not in our group's qgstat - create a stub
+                        job_info = JobInfo(
+                            job_id=job_id, name="?", user="?",
+                            time_use="?", state="R", queue=resv_id,
+                        )
+
+                    job_info.node_gpus[node_name] = gpus
+
+                    if job_info.user == my_user:
+                        nu.gpus_used_own += gpus
+                        # Enrich own jobs with qstat -f details
+                        if not job_info.is_detailed:
+                            kv = parse_qstat_full(job_id)
+                            if kv:
+                                job_info.is_detailed = True
+                                vlist = kv.get("Variable_List", "")
+                                rm = re.search(r"RTYPE=(\w+)", vlist)
+                                if rm:
+                                    job_info.rtype = rm.group(1)
+                    else:
+                        nu.gpus_used_other += gpus
+
+                    nu.jobs.append(job_info)
+
+        results.append((resv, node_map))
+
+    return results
+
+# ── Rendering ───────────────────────────────────────────────────────────────
+
+def render_gpu_bar(own: int, other: int, total: int = 8, width: int = 8) -> str:
+    """Render GPU usage bar like [████░░░░]."""
+    used = own + other
+    if used > total:
+        used = total
+        other = max(0, total - own)
+
+    own_blocks = min(own, width)
+    other_blocks = min(other, width - own_blocks)
+    free_blocks = width - own_blocks - other_blocks
+
+    bar = (C.GREEN + "█" * own_blocks +
+           C.YELLOW + "█" * other_blocks +
+           C.DIM + "░" * free_blocks +
+           C.RESET)
+    return f"[{bar}]"
+
+
+def render_state(state: str) -> str:
+    """Colorize reservation state."""
+    if state == "RN":
+        return f"{C.GREEN}{C.BOLD}RUNNING{C.RESET}"
+    elif state == "CO":
+        return f"{C.YELLOW}{C.BOLD}CONFIRMED{C.RESET}"
+    elif state == "DG":
+        return f"{C.RED}{C.BOLD}DEGRADED{C.RESET}"
+    return f"{C.DIM}{state}{C.RESET}"
+
+
+def render_job_counts(run: int, que: int, hld: int) -> str:
+    """Render job count summary like 3R/0Q/0H."""
+    parts = []
+    parts.append(f"{C.GREEN}{run}R{C.RESET}" if run else f"{C.DIM}0R{C.RESET}")
+    parts.append(f"{C.YELLOW}{que}Q{C.RESET}" if que else f"{C.DIM}0Q{C.RESET}")
+    parts.append(f"{C.RED}{hld}H{C.RESET}" if hld else f"{C.DIM}0H{C.RESET}")
+    return "/".join(parts)
+
+
+def render_dashboard(data: List[Tuple[Reservation, Dict[str, NodeUsage]]], compact: bool = False):
+    """Print the full dashboard."""
+    try:
+        term_width = os.get_terminal_size().columns
+    except OSError:
+        term_width = 80
+
+    my_user = os.environ.get("USER", "")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    title = f" {C.BOLD}{C.CYAN}ABCI Reservation Monitor{C.RESET}"
+    print(f"{title}{' ' * max(1, term_width - 50)}{C.DIM}{now}{C.RESET}")
+    print(f" {C.DIM}{'═' * (term_width - 2)}{C.RESET}")
+
+    total_gpus = 0
+    total_gpus_used = 0
+    total_nodes = 0
+    total_nodes_active = 0
+
+    if not data:
+        print(f"\n  {C.DIM}No reservations found.{C.RESET}\n")
+        return
+
+    for resv, node_map in data:
+        # Reservation header
+        state_str = render_state(resv.state)
+        counts_str = render_job_counts(resv.queue_run, resv.queue_queued, resv.queue_held)
+        print()
+        print(f" {C.BOLD}{C.WHITE}{resv.resv_id}{C.RESET}  {state_str}  "
+              f"{resv.start} → {resv.end}  "
+              f"{C.BOLD}{resv.node_count}{C.RESET} nodes  {counts_str}")
+        print(f" {C.DIM}{'─' * (term_width - 2)}{C.RESET}")
+
+        if resv.state == "CO":
+            node_list = " ".join(resv.nodes[:6])
+            if len(resv.nodes) > 6:
+                node_list += " ..."
+            print(f"  {C.DIM}Starts {resv.start}. Nodes: {node_list}{C.RESET}")
+            total_nodes += resv.node_count
+            total_gpus += resv.node_count * 8
+            continue
+
+        # Per-node display
+        resv_gpus = 0
+        resv_gpus_used = 0
+        resv_nodes_active = 0
+
+        for node_name in resv.nodes:
+            nu = node_map[node_name]
+            used = nu.gpus_used_own + nu.gpus_used_other
+            bar = render_gpu_bar(nu.gpus_used_own, nu.gpus_used_other, nu.gpus_total)
+            resv_gpus += nu.gpus_total
+            resv_gpus_used += used
+
+            node_color = C.WHITE + C.BOLD if used > 0 else C.DIM
+            usage_str = f"{used}/{nu.gpus_total} GPUs"
+            print(f"  {node_color}{node_name}{C.RESET}  {bar} {usage_str}")
+
+            if not compact and nu.jobs:
+                seen_jobs = set()
+                unique_jobs = []
+                for job in nu.jobs:
+                    if job.job_id not in seen_jobs:
+                        seen_jobs.add(job.job_id)
+                        unique_jobs.append(job)
+                for i, job in enumerate(unique_jobs):
+                    gpus_on_node = job.node_gpus.get(node_name, 0)
+                    rtype_str = f" {C.DIM}({job.rtype}){C.RESET}" if job.rtype else ""
+                    user_color = C.GREEN if job.user == my_user else C.YELLOW
+                    is_last = i == len(unique_jobs) - 1
+                    prefix = "└─" if is_last else "├─"
+                    print(f"            {C.DIM}{prefix}{C.RESET} {user_color}{job.user}{C.RESET}  "
+                          f"{job.name:<16s}  {gpus_on_node} GPU  "
+                          f"{C.DIM}{job.time_use}{C.RESET}{rtype_str}")
+
+            if used > 0:
+                resv_nodes_active += 1
+
+        # Summary
+        pct = (resv_gpus_used / resv_gpus * 100) if resv_gpus > 0 else 0
+        print()
+        pct_color = C.GREEN if pct < 50 else (C.YELLOW if pct < 80 else C.RED)
+        print(f"  {C.BOLD}Summary:{C.RESET} {resv_gpus_used}/{resv_gpus} GPUs used "
+              f"({pct_color}{pct:.0f}%{C.RESET})"
+              f" │ {resv_nodes_active}/{resv.node_count} nodes active")
+
+        total_gpus += resv_gpus
+        total_gpus_used += resv_gpus_used
+        total_nodes += resv.node_count
+        total_nodes_active += resv_nodes_active
+
+    # Overall footer
+    print(f"\n {C.DIM}{'═' * (term_width - 2)}{C.RESET}")
+    overall_pct = (total_gpus_used / total_gpus * 100) if total_gpus > 0 else 0
+    pct_color = C.GREEN if overall_pct < 50 else (C.YELLOW if overall_pct < 80 else C.RED)
+    print(f" {C.BOLD}Overall:{C.RESET} {total_gpus_used}/{total_gpus} GPUs "
+          f"({pct_color}{overall_pct:.0f}%{C.RESET})"
+          f" │ {total_nodes_active}/{total_nodes} nodes active"
+          f" │ {len(data)} reservations")
+    print()
+
+# ── Main ────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="ABCI Reservation Monitor - htop-like node usage visualization",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("-r", "--resv", help="Show only specific reservation(s), comma-separated")
+    parser.add_argument("-w", "--watch", type=int, metavar="SEC", help="Refresh every N seconds")
+    parser.add_argument("-c", "--compact", action="store_true", help="Compact mode (no job details)")
+    parser.add_argument("--no-color", action="store_true", help="Disable colors")
+    args = parser.parse_args()
+
+    if args.no_color:
+        global NO_COLOR
+        NO_COLOR = True
+        for attr in dir(C):
+            if not attr.startswith("_"):
+                setattr(C, attr, "")
+
+    resv_filter = args.resv.split(",") if args.resv else None
+
+    if args.watch:
+        try:
+            while True:
+                sys.stdout.write("\033[2J\033[H")
+                sys.stdout.flush()
+                data = build_dashboard(resv_filter)
+                render_dashboard(data, compact=args.compact)
+                time.sleep(args.watch)
+        except KeyboardInterrupt:
+            print()
+    else:
+        data = build_dashboard(resv_filter)
+        render_dashboard(data, compact=args.compact)
+
+
+if __name__ == "__main__":
+    main()
