@@ -23,8 +23,6 @@ qsub_shell --resv R1538111 -q rt_AG  # Reserved node with specific resource type
 | `-g` | `--gres gpu:N` | Number of GPUs (use 0 for CPU-only) | 1 |
 | | `--no-gpu` | CPU-only mode | |
 | `-t` | `--time MINUTES` | Time limit in minutes | 30 |
-| `-m` | `--mem GB` | Memory in GB | 8 |
-| `-c` | `--cores N` | Number of CPU cores | 1 |
 | `-p` | `--project NAME` | Project group name | gch51606 |
 | `-q` | `--queue NAME` | Queue / resource type | rt_HG |
 | `-r` | `--resv ID` | Reservation ID (e.g., R1538111) | |
@@ -105,8 +103,8 @@ Edit the default project group name in `qsub_shell` (`PROJECT_GROUP`) to match y
 | Resource Type | GPUs | CPUs | Memory | Use Case |
 |---------------|------|------|--------|----------|
 | `rt_HC` | 0 | 32 | 320GB | CPU-only tasks |
-| `rt_HG` | 1 | 24 | 160GB | Single GPU workloads |
-| `rt_HF` | 8 | 192 | Full node | Multi-GPU / full node jobs |
+| `rt_HG` | 1 | 16 | 160GB | Single GPU workloads |
+| `rt_HF` | 8 | 192 | 1920GB | Multi-GPU / full node jobs |
 
 ## Requirements
 

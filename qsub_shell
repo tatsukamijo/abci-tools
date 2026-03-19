@@ -6,9 +6,7 @@
 #   -g, --gres gpu:N    Number of GPUs (default: 1, use 0 or --no-gpu for CPU-only)
 #   --no-gpu            CPU-only mode (equivalent to -g 0)
 #   -t, --time MINUTES  Time limit in minutes (default: 30)
-#   -m, --mem GB        Memory in GB (default: 8)
-#   -c, --cores N       Number of CPU cores (default: 1)
-#   -p, --project NAME  Project group name (default: gcf51142)
+#   -p, --project NAME  Project group name (default: gch51606)
 #   -q, --queue NAME    Queue name (default: rt_HG for GPU, rt_HC for CPU-only)
 #   -r, --resv ID       Reservation ID (e.g., R1538111)
 #   -n, --name NAME     Job name (default: interactive)
@@ -19,8 +17,6 @@ set -e
 # Default values
 GPU_COUNT=1
 TIME_LIMIT=30
-MEMORY_GB=8
-CPU_CORES=1
 PROJECT_GROUP="gch51606"
 QUEUE_NAME="rt_HG"
 RESERVATION_ID=""
@@ -38,10 +34,8 @@ Options:
     -g, --gres gpu:N    Number of GPUs (default: 1, use 0 or --no-gpu for CPU-only)
     --no-gpu            CPU-only mode (equivalent to -g 0)
     -t, --time MINUTES  Time limit in minutes (default: 30)
-    -m, --mem GB        Memory in GB (default: 8)
-    -c, --cores N       Number of CPU cores (default: 1)
-    -p, --project NAME  Project group name (default: gcf51142)
-    -q, --queue NAME    Queue name (default: rt_HG for GPU, rt_HC for CPU-only)
+    -p, --project NAME  Project group name (default: gch51606)
+    -q, --queue NAME    Queue / resource type (default: rt_HG for GPU, rt_HC for CPU-only)
     -r, --resv ID       Reservation ID (e.g., R1538111)
     -n, --name NAME     Job name (default: interactive)
     -h, --help          Show this help
@@ -52,14 +46,12 @@ Examples:
     qsub_shell --gres gpu:4 --time 120  # 4 GPUs, 120 minutes
     qsub_shell --no-gpu                 # CPU-only mode
     qsub_shell -g 0                     # CPU-only mode (alternative)
-    qsub_shell -m 16 -c 4               # 16GB RAM, 4 CPU cores
     qsub_shell --resv R1538111           # Use reserved node
 
-Resource Types:
+Resource Types (CPU/Memory are fixed per type):
     rt_HC: CPU-only, CPU32, Memory320GB
     rt_HG: GPU1, CPU16, Memory160GB
-    rt_AG: GPU4, CPU64, Memory512GB
-    rt_G:  GPU8, CPU128, Memory1024GB
+    rt_HF: GPU8, CPU192, Memory1920GB (full node)
 EOF
 }
 
@@ -86,14 +78,6 @@ while [[ $# -gt 0 ]]; do
             ;;
         -t|--time)
             TIME_LIMIT="$2"
-            shift 2
-            ;;
-        -m|--mem)
-            MEMORY_GB="$2"
-            shift 2
-            ;;
-        -c|--cores)
-            CPU_CORES="$2"
             shift 2
             ;;
         -p|--project)
@@ -132,16 +116,6 @@ fi
 
 if ! [[ "$TIME_LIMIT" =~ ^[0-9]+$ ]] || [ "$TIME_LIMIT" -lt 1 ]; then
     echo "Error: Time limit must be a positive integer" >&2
-    exit 1
-fi
-
-if ! [[ "$MEMORY_GB" =~ ^[0-9]+$ ]] || [ "$MEMORY_GB" -lt 1 ]; then
-    echo "Error: Memory must be a positive integer" >&2
-    exit 1
-fi
-
-if ! [[ "$CPU_CORES" =~ ^[0-9]+$ ]] || [ "$CPU_CORES" -lt 1 ]; then
-    echo "Error: CPU cores must be a positive integer" >&2
     exit 1
 fi
 
