@@ -3,11 +3,11 @@
 # ABCI Interactive Shell Launcher
 # Usage: qsub_shell [OPTIONS]
 # Options:
-#   -g, --gres gpu:N    Number of GPUs (default: 1, use 0 or --no-gpu for CPU-only)
-#   --no-gpu            CPU-only mode (equivalent to -g 0)
+#   --full              Full node mode (rt_HF: 8 GPUs, 192 CPUs)
+#   --no-gpu            CPU-only mode (rt_HC: 32 CPUs)
 #   -t, --time MINUTES  Time limit in minutes (default: 30)
 #   -p, --project NAME  Project group name (default: gch51606)
-#   -q, --queue NAME    Queue name (default: rt_HG for GPU, rt_HC for CPU-only)
+#   -q, --queue NAME    Resource type override (rt_HG, rt_HF, rt_HC)
 #   -r, --resv ID       Reservation ID (e.g., R1538111)
 #   -n, --name NAME     Job name (default: interactive)
 #   -h, --help          Show this help
@@ -15,13 +15,11 @@
 set -e
 
 # Default values
-GPU_COUNT=1
 TIME_LIMIT=30
 PROJECT_GROUP="gch51606"
 QUEUE_NAME="rt_HG"
 RESERVATION_ID=""
 JOB_NAME="interactive"
-CPU_ONLY=false
 
 # Help function
 show_help() {
@@ -31,49 +29,38 @@ ABCI Interactive Shell Launcher
 Usage: qsub_shell [OPTIONS]
 
 Options:
-    -g, --gres gpu:N    Number of GPUs (default: 1, use 0 or --no-gpu for CPU-only)
-    --no-gpu            CPU-only mode (equivalent to -g 0)
+    --full              Full node mode (rt_HF: 8 GPUs, 192 CPUs)
+    --no-gpu            CPU-only mode (rt_HC: 32 CPUs)
     -t, --time MINUTES  Time limit in minutes (default: 30)
     -p, --project NAME  Project group name (default: gch51606)
-    -q, --queue NAME    Queue / resource type (default: rt_HG for GPU, rt_HC for CPU-only)
+    -q, --queue NAME    Resource type override (rt_HG, rt_HF, rt_HC)
     -r, --resv ID       Reservation ID (e.g., R1538111)
     -n, --name NAME     Job name (default: interactive)
     -h, --help          Show this help
 
 Examples:
-    qsub_shell                           # Default: 1 GPU, 30 min
-    qsub_shell -g 2 -t 60               # 2 GPUs, 60 minutes
-    qsub_shell --gres gpu:4 --time 120  # 4 GPUs, 120 minutes
+    qsub_shell                           # Default: 1 GPU (rt_HG), 30 min
+    qsub_shell --full -t 60             # Full node (8 GPUs), 60 minutes
     qsub_shell --no-gpu                 # CPU-only mode
-    qsub_shell -g 0                     # CPU-only mode (alternative)
-    qsub_shell --resv R1538111           # Use reserved node
+    qsub_shell --resv R1538111           # Reserved node, 1 GPU
+    qsub_shell --resv R1538111 --full    # Reserved node, full node
 
 Resource Types (CPU/Memory are fixed per type):
-    rt_HC: CPU-only, CPU32, Memory320GB
-    rt_HG: GPU1, CPU16, Memory160GB
-    rt_HF: GPU8, CPU192, Memory1920GB (full node)
+    rt_HG: 1 GPU,  16 CPUs, 160GB memory (default)
+    rt_HF: 8 GPUs, 192 CPUs, 1920GB memory (full node)
+    rt_HC: 0 GPUs, 32 CPUs, 320GB memory (CPU-only)
 EOF
 }
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
-        -g|--gres)
-            if [[ $2 == gpu:* ]]; then
-                GPU_COUNT="${2#gpu:}"
-                shift 2
-            elif [[ $2 =~ ^[0-9]+$ ]]; then
-                # Allow direct number specification like -g 0
-                GPU_COUNT="$2"
-                shift 2
-            else
-                echo "Error: GPU specification must be 'gpu:N' or a number" >&2
-                exit 1
-            fi
+        --full)
+            QUEUE_NAME="rt_HF"
+            shift
             ;;
         --no-gpu)
-            GPU_COUNT=0
-            CPU_ONLY=true
+            QUEUE_NAME="rt_HC"
             shift
             ;;
         -t|--time)
@@ -109,20 +96,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Validate inputs
-if ! [[ "$GPU_COUNT" =~ ^[0-9]+$ ]] || [ "$GPU_COUNT" -lt 0 ]; then
-    echo "Error: GPU count must be a non-negative integer" >&2
-    exit 1
-fi
-
 if ! [[ "$TIME_LIMIT" =~ ^[0-9]+$ ]] || [ "$TIME_LIMIT" -lt 1 ]; then
     echo "Error: Time limit must be a positive integer" >&2
     exit 1
-fi
-
-# Set queue based on GPU count
-if [ "$GPU_COUNT" -eq 0 ] || [ "$CPU_ONLY" = true ]; then
-    QUEUE_NAME="rt_HC"
-    GPU_COUNT=0
 fi
 
 # Convert time to HH:MM:SS format
@@ -132,34 +108,27 @@ TIME_FORMATTED=$(printf "%02d:%02d:00" $HOURS $MINUTES)
 
 # Build qsub command
 if [ -n "$RESERVATION_ID" ]; then
-    # Reservation mode: queue = reservation ID, resource type passed via -v RTYPE
     QSUB_CMD="qsub -I -P $PROJECT_GROUP -q $RESERVATION_ID -v RTYPE=$QUEUE_NAME -l select=1 -l walltime=$TIME_FORMATTED -N $JOB_NAME"
 else
     QSUB_CMD="qsub -I -P $PROJECT_GROUP -q $QUEUE_NAME -l select=1 -l walltime=$TIME_FORMATTED -N $JOB_NAME"
 fi
 
-# Add GPU specification if using multi-GPU queues
-if [ "$QUEUE_NAME" = "rt_AG" ] || [ "$QUEUE_NAME" = "rt_G" ]; then
-    QSUB_CMD="$QSUB_CMD -l gpu=$GPU_COUNT"
-fi
-
+# Display job info
 echo "Starting interactive job with:"
 echo "  Project: $PROJECT_GROUP"
 if [ -n "$RESERVATION_ID" ]; then
     echo "  Reservation: $RESERVATION_ID"
-    echo "  Resource type: $QUEUE_NAME"
-else
-    echo "  Queue: $QUEUE_NAME"
 fi
-if [ "$GPU_COUNT" -eq 0 ]; then
-    echo "  GPUs: CPU-only mode"
-else
-    echo "  GPUs: $GPU_COUNT"
-fi
+echo "  Resource type: $QUEUE_NAME"
+case $QUEUE_NAME in
+    rt_HG) echo "  Resources: 1 GPU, 16 CPUs, 160GB" ;;
+    rt_HF) echo "  Resources: 8 GPUs, 192 CPUs, 1920GB (full node)" ;;
+    rt_HC) echo "  Resources: CPU-only, 32 CPUs, 320GB" ;;
+esac
 echo "  Time limit: $TIME_LIMIT minutes ($TIME_FORMATTED)"
 echo "  Job name: $JOB_NAME"
 echo "  Command: $QSUB_CMD"
 echo
 
 # Execute qsub command
-exec $QSUB_CMD 
+exec $QSUB_CMD

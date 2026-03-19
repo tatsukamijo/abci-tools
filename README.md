@@ -9,22 +9,22 @@ Command-line tools for [ABCI](https://abci.ai/en/) (AI Bridging Cloud Infrastruc
 Simplifies launching interactive sessions on ABCI with sensible defaults.
 
 ```bash
-qsub_shell                           # Default: 1 GPU, 30 min
-qsub_shell -g 2 -t 60               # 2 GPUs, 60 minutes
+qsub_shell                           # Default: 1 GPU (rt_HG), 30 min
+qsub_shell --full -t 60             # Full node (8 GPUs), 60 minutes
 qsub_shell --no-gpu                  # CPU-only mode
-qsub_shell --resv R1538111           # Use reserved node
-qsub_shell --resv R1538111 -q rt_AG  # Reserved node with specific resource type
+qsub_shell --resv R1538111           # Reserved node, 1 GPU
+qsub_shell --resv R1538111 --full    # Reserved node, full node
 ```
 
 #### Options
 
 | Option | Long Option | Description | Default |
 |--------|-------------|-------------|---------|
-| `-g` | `--gres gpu:N` | Number of GPUs (use 0 for CPU-only) | 1 |
-| | `--no-gpu` | CPU-only mode | |
+| | `--full` | Full node mode (rt_HF: 8 GPUs) | |
+| | `--no-gpu` | CPU-only mode (rt_HC) | |
 | `-t` | `--time MINUTES` | Time limit in minutes | 30 |
 | `-p` | `--project NAME` | Project group name | gch51606 |
-| `-q` | `--queue NAME` | Queue / resource type | rt_HG |
+| `-q` | `--queue NAME` | Resource type override | rt_HG |
 | `-r` | `--resv ID` | Reservation ID (e.g., R1538111) | |
 | `-n` | `--name NAME` | Job name | interactive |
 | `-h` | `--help` | Show help | |
